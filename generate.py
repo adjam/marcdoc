@@ -23,8 +23,16 @@ from collections import OrderedDict
 from urlparse import urljoin
 import hashlib
 import re
-import os
+import os, sys
 import json
+
+def normalize(input_string):
+    return input_string and re.sub(r"\s+"," ",input_string).strip() or input_string
+
+
+def two_split(input_string,delimiter='-'):
+    """splits a string into at most two parts and normalizes each part"""
+    return [ normalize(x) for x in input_string.split('-',1) ]
 
 
 class Crawler(object):
@@ -34,12 +42,12 @@ class Crawler(object):
     you'd like.
     """
 
-
+    CONTROL_FIELDS = set(('001','003', '005', '006', '007', '008'))
 
     # tag, name, repeatability
     field_basics_re = re.compile(r"^\s*([0-9]{3})\s*-\s*(.*)\s+\((N?R)\)$")
 
-    subfield_re = re.compile(r"^\s*\$(.)\s*-\s*(.*)\s*\((N?R)\)")
+    subfield_re = re.compile(r"^\s*\$(.-?.?)\s+-\s+(.*)(?:\s*\((N?R)\))?$")
 
     def __init__(self,cacher=None):
         """
@@ -96,27 +104,91 @@ class Crawler(object):
             definition = dom("p").eq(0)
         if not definition.size():
             definition = PyQuery("<p>Bad HTML: %s</p>" % url)
-        subfields = self.get_subfields(dom)
+        if tag not in self.CONTROL_FIELDS:
+            subfields = self.get_subfields(dom)
+            if '?' in subfields: 
+                raise Exception("can't parse subfields in " + url)
+            try:
+                indicators = self.get_indicators(dom)
+            except Exception, e:
+                import traceback, sys
+                traceback.print_exception(*sys.exc_info())
+                print e
+                raise Exception("Can't get indicators from " + url, e)
+        else:
+            subfields = ()
+            indicators = ()
+
+        return tag, dict(title=title,definition=normalize(definition.text()),repeatable=repeatable, subfields=subfields,indicators=indicators)
         
-        return tag, dict(title=title,definition=definition.text(),repeatable=repeatable, subfields=subfields)
-        
+
     def get_subfields(self,dom):
         rv = OrderedDict()
-        values = dom("div.subfieldvalue")
-        for v in values:
-            m = self.subfield_re.match(v.text)
+        values = dom("body > div.subfieldvalue")
+        def handler(idx,pel):
+            pel = PyQuery(pel)
+            txt = re.sub(r"\n+", " ", pel.text())
+            m = self.subfield_re.match(txt)
             if m:
-                sf =m.group(1).strip()
+                sf = m.group(1).strip()
                 desc = m.group(2).strip()
-                repeatability = m.group(3) == 'R'
+                if len(m.groups()) > 2:
+                    repeatability = m.group(3) == 'R'
+                else:
+                    repeatability = None
             else:
+                sys.stderr.write("<<<" + txt + ">>>")
                 sf,desc,repeatability = "?", "?", False
-            extra = [ x.text for x in v.findall("div") if x.get("class","") == 'description' and x.text is not None ]
-
-            rv[sf] = dict(description=desc,repeatable=repeatability,extra_desc=extra > 0 and " ".join(extra).strip() or "")            
-
+            extra = [ x.text for x in pel("div.description") if x.text is not None ]
+            rv[sf] = dict(description=desc,definition=len(extra) > 0 and normalize(" ".join(extra)) or "")
+            if repeatability is not None:
+                rv[sf]['repeatable'] = repeatability
+            else:
+                rv[sf]['range'] = True           
+        values.each(handler)
         return rv
 
+    def parse_indicator(self,dom):
+        txt = dom[0].text.strip()
+        definition = two_split(txt)[1]
+        values = OrderedDict()
+        for val in dom.eq(0)("div.indicatorvalue"):
+            v,d = two_split(val.text)
+            if v not in ('First','Second'):
+                values[v] = d
+        desc =  dom.eq(0)("div.description")
+        desc = desc.size() > 0 and normalize(desc.eq(0).text()) or ""
+        return dict(definition=definition,values=values,description=desc)
+    
+    def _indicator_dl(self,dom):
+        """024 puts indicators in a nicer, but still outlier, HTML
+        definition list"""
+        dl = dom("div.indicators dl")
+        inds = []
+        values = OrderedDict()
+        definition = ""
+        for el in dl:
+            if el.tag == 'dt':
+                if values:
+                    inds.append(dict(definition=definition,values=values))
+                    values = OrderedDict()
+                definition = el.text.split("-")[1].strip()
+            elif el.tag == 'dd':
+                k,v = two_split(el.text)
+                values[k] = v
+        if len(inds) < 2:
+            inds.append(dict(definition=definition,values=values) )
+        return inds
+
+    def get_indicators(self,dom):
+        tli = dom("body div.indicatorvalue")
+        if tli.size() >= 2:
+            first = self.parse_indicator(tli.eq(0))
+            second = self.parse_indicator(tli.eq(1))
+            return first,second
+        else:
+            return self._indicator_dl(dom)
+        return ({},{})
 
     def get_field_def(self,dom):
         h1 = dom("h1")
@@ -137,8 +209,7 @@ class Crawler(object):
 
     def get_dom(self,url):
         dom = PyQuery(self.cacher.fetch_text(url))
-        dom.xhtml_to_html()
-        return dom
+        return dom.xhtml_to_html()
 
     def get_concise_pages(self,url):
         pq = self.get_dom(url)
